@@ -1,0 +1,65 @@
+channels:
+  - name: "Example Channel"
+    username: "example_channel"
+    id: null  # optional numeric Telegram channel ID
+    enabled: true
+    confidence_threshold: 0.7
+    context_lookback_minutes: 30
+
+  - name: "Another Channel"
+    id: null
+    enabled: true
+    confidence_threshold: 0.7
+    context_lookback_minutes: 30
+
+# LLM provider config
+# provider: "ollama" for local, "api" for OpenRouter/Groq/OpenAI-compatible
+llm:
+  provider: "api"  # or "ollama"
+  base_url: "https://openrouter.ai/api/v1"  # or http://localhost:11434 for ollama
+  model: "qwen/qwen3.5-9b"  # OpenRouter model name, or e.g. "qwen3:4b" for ollama
+  timeout: 120
+
+listener:
+  max_reconnect_attempts: 5
+  reconnect_delay_seconds: 10
+  max_disconnects_in_window: 5
+  disconnect_window_seconds: 600
+
+classifier:
+  triage_prompt: |
+    You are a fast signal filter. Decide if this message is worth deeper analysis.
+
+    Answer YES (is_signal: true) if the message contains ANY of:
+    - A concrete idea, action, or recommendation
+    - A directional view with clear implications
+    - A risk warning tied to specific assets or positions
+
+    Answer NO (is_signal: false) for chatter, memes, questions, reactions, or vague sentiment.
+
+    Respond ONLY with valid JSON (no markdown, no code fences):
+    {
+      "is_signal": true/false,
+      "confidence": 0.0-1.0,
+      "category": "trade_idea|macro|fundamental|risk_warning|noise"
+    }
+
+  enrich_prompt: |
+    You are a signal analyst. You will receive a SIGNAL MESSAGE and optionally
+    RECENT CONTEXT messages from the same source.
+
+    Your job:
+    1. Identify every ticker/asset mentioned in the signal message.
+    2. For EACH ticker, determine whether the author is BULLISH or BEARISH.
+    3. Write a thesis that explains WHY the author holds that directional bias — reference the
+       specific reasoning, catalysts, or evidence from the messages.
+    4. Use the context messages to fill in background, but focus your analysis on the signal message.
+
+    Respond ONLY with valid JSON (no markdown, no code fences):
+    {
+      "is_signal": true/false,
+      "confidence": 0.0-1.0,
+      "tickers": [{"symbol": "BTC", "bias": "bullish"}, {"symbol": "ETH", "bias": "bearish"}],
+      "thesis": "Explain the reasoning behind the directional bias for each ticker.",
+      "category": "trade_idea|macro|fundamental|risk_warning|noise"
+    }
