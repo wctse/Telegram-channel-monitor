@@ -20,6 +20,9 @@ llm:
   model: "qwen/qwen3.5-9b"  # OpenRouter model name, or e.g. "qwen3:4b" for ollama
   timeout: 120
 
+error_alerts:
+  enabled: true  # Send Telegram messages on ERROR-level logs
+
 listener:
   max_reconnect_attempts: 5
   reconnect_delay_seconds: 10

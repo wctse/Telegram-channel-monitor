@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import os
+import re
 import sys
+import time
+from collections import deque
 
 import yaml
 from dotenv import load_dotenv
@@ -10,6 +13,81 @@ from src.db import init_db
 from src.classifier import LLMClassifier
 from src.forwarder import SignalForwarder
 from src.listener import ChannelListener
+
+
+class TelegramErrorHandler(logging.Handler):
+    """Logging handler that sends ERROR+ messages to Telegram via the forwarder.
+
+    - Rate-limited to MAX_PER_MINUTE messages per 60-second sliding window.
+    - Identical messages (same logger + message template) are silenced after
+      the first occurrence; a count is appended when a *new* error arrives.
+    - Sensitive patterns (API keys, tokens) are redacted before sending.
+    """
+
+    MAX_PER_MINUTE = 10
+    WINDOW_SECONDS = 60
+    _REDACT_RE = re.compile(
+        r'(Bearer\s+)\S+|'            # Authorization headers
+        r'(api[_-]?key["\s:=]+)\S+|'   # api_key=... / api-key: ...
+        r'(token["\s:=]+)\S+',         # token=...
+        re.IGNORECASE,
+    )
+
+    def __init__(self, forwarder: "SignalForwarder"):
+        super().__init__(level=logging.ERROR)
+        self.forwarder = forwarder
+        self._send_times: deque[float] = deque()
+        self._seen: dict[str, int] = {}  # msg_key -> suppressed count
+        self._suppressed_total: int = 0
+
+    def emit(self, record: logging.LogRecord):
+        now = time.monotonic()
+
+        # --- dedup: key on logger name + unformatted message template ---
+        msg_key = f"{record.name}:{record.getMessage()}"
+        if msg_key in self._seen:
+            self._seen[msg_key] += 1
+            self._suppressed_total += 1
+            return
+        self._seen[msg_key] = 0
+
+        # --- sliding-window rate limit ---
+        while self._send_times and self._send_times[0] <= now - self.WINDOW_SECONDS:
+            self._send_times.popleft()
+        if len(self._send_times) >= self.MAX_PER_MINUTE:
+            self._suppressed_total += 1
+            return
+
+        try:
+            self._send_times.append(now)
+            message = self._redact(self.format(record))
+
+            # Append suppressed summary if any
+            suppressed = self._suppressed_total
+            seen_dupes = {k: v for k, v in self._seen.items() if v > 0}
+            self._suppressed_total = 0
+            self._seen.clear()
+            self._seen[msg_key] = 0  # keep current key registered
+
+            footer_parts = []
+            if suppressed:
+                footer_parts.append(f"+{suppressed} suppressed error(s) since last alert")
+            if seen_dupes:
+                footer_parts.append(
+                    "silenced repeats: "
+                    + ", ".join(f"{k.split(':', 1)[-1][:80]}... x{v}" for k, v in seen_dupes.items())
+                )
+            if footer_parts:
+                message += "\n\n(" + " | ".join(footer_parts) + ")"
+
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.forwarder.send_error_alert(message))
+        except RuntimeError:
+            pass  # no running loop yet
+
+    @classmethod
+    def _redact(cls, text: str) -> str:
+        return cls._REDACT_RE.sub(lambda m: m.group(0).split()[0] + " [REDACTED]" if m.group(0).split() else "[REDACTED]", text)
 
 load_dotenv()
 
@@ -95,6 +173,14 @@ async def main():
     try:
         await classifier.open()
         await forwarder.start_bot()
+
+        # Attach Telegram error alerts if enabled
+        if config.get("error_alerts", {}).get("enabled", True):
+            error_handler = TelegramErrorHandler(forwarder)
+            error_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            logging.getLogger().addHandler(error_handler)
+            logger.info("Telegram error alerts enabled")
+
         logger.info("Bot is running. Send /start to your bot to register for alerts.")
         await listener.start()
     finally:
