@@ -109,7 +109,7 @@ class LLMClassifier:
             logger.error("HTTP error calling Ollama: %s", e)
             return None
         except Exception as e:
-            logger.error("Unexpected error in classifier: %s", e)
+            logger.error("Unexpected error in classifier: %r", e, exc_info=True)
             return None
 
     async def _call_api(self, system_prompt: str, user_content: str) -> str | None:
@@ -149,7 +149,7 @@ class LLMClassifier:
             logger.error("HTTP error calling API: %s", e)
             return None
         except Exception as e:
-            logger.error("Unexpected error in classifier: %s", e)
+            logger.error("Unexpected error in classifier: %r", e, exc_info=True)
             return None
 
     @staticmethod

@@ -45,6 +45,9 @@ class ChannelListener:
         self._handlers_registered = False
         self._stopping = False
         self._disconnect_timestamps: deque[float] = deque()
+        self._raw_update_counts: dict[str, int] = {}
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_interval: float = 3600.0
 
     async def start(self):
         self._stopping = False
@@ -159,13 +162,24 @@ class ChannelListener:
                 chat_id = update.channel_id
 
             if chat_id and self._normalize_id(chat_id) in monitored_norm_ids:
-                logger.info("[RAW-MONITORED] %s from chat_id=%s", update_type, chat_id)
+                self._raw_update_counts[update_type] = self._raw_update_counts.get(update_type, 0) + 1
+                self._maybe_log_heartbeat()
 
         @self.client.on(events.NewMessage())
         async def on_new_message(event):
             await self._handle_message(event)
 
         self._handlers_registered = True
+
+    def _maybe_log_heartbeat(self):
+        now = time.monotonic()
+        if now - self._last_heartbeat < self._heartbeat_interval:
+            return
+        self._last_heartbeat = now
+        total = sum(self._raw_update_counts.values())
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(self._raw_update_counts.items()))
+        logger.info("💓 Heartbeat: %d raw updates in last hour (%s)", total, breakdown)
+        self._raw_update_counts.clear()
 
     @staticmethod
     def _clear_update_state():
