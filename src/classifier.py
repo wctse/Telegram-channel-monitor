@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import aiohttp
@@ -31,7 +32,7 @@ class LLMClassifier:
         """Create the shared HTTP session. Call once at startup."""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                timeout=aiohttp.ClientTimeout(connect=10, sock_read=self.timeout),
             )
 
     async def close(self):
@@ -92,25 +93,33 @@ class LLMClassifier:
             },
         }
 
-        try:
-            session = self._get_session()
-            async with session.post(
-                f"{self.base_url}/api/chat",
-                json=payload,
-            ) as resp:
-                if resp.status != 200:
-                    logger.error("Ollama API error: %s", await resp.text())
+        for attempt in range(2):
+            try:
+                session = self._get_session()
+                async with session.post(
+                    f"{self.base_url}/api/chat",
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        logger.error("Ollama API error: %s", await resp.text())
+                        return None
+
+                    data = await resp.json()
+                    return data.get("message", {}).get("content", "")
+
+            except asyncio.TimeoutError:
+                if attempt == 0:
+                    logger.warning("Ollama request timed out (attempt %d), retrying...", attempt + 1)
+                else:
+                    logger.error("Ollama request timed out after %d attempts", attempt + 1)
                     return None
-
-                data = await resp.json()
-                return data.get("message", {}).get("content", "")
-
-        except aiohttp.ClientError as e:
-            logger.error("HTTP error calling Ollama: %s", e)
-            return None
-        except Exception as e:
-            logger.error("Unexpected error in classifier: %r", e, exc_info=True)
-            return None
+            except aiohttp.ClientError as e:
+                logger.error("HTTP error calling Ollama: %s", e)
+                return None
+            except Exception as e:
+                logger.error("Unexpected error in classifier: %r", e, exc_info=True)
+                return None
+        return None
 
     async def _call_api(self, system_prompt: str, user_content: str) -> str | None:
         headers = {"Content-Type": "application/json"}
@@ -127,30 +136,38 @@ class LLMClassifier:
             "response_format": {"type": "json_object"},
         }
 
-        try:
-            session = self._get_session()
-            async with session.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as resp:
-                if resp.status != 200:
-                    logger.error("API error: %s", await resp.text())
-                    return None
+        for attempt in range(2):
+            try:
+                session = self._get_session()
+                async with session.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    if resp.status != 200:
+                        logger.error("API error: %s", await resp.text())
+                        return None
 
-                data = await resp.json()
-                choices = data.get("choices")
-                if not choices or not isinstance(choices, list):
-                    logger.error("Malformed API response: missing 'choices'. Body: %s", data)
-                    return None
-                return choices[0].get("message", {}).get("content", "")
+                    data = await resp.json()
+                    choices = data.get("choices")
+                    if not choices or not isinstance(choices, list):
+                        logger.error("Malformed API response: missing 'choices'. Body: %s", data)
+                        return None
+                    return choices[0].get("message", {}).get("content", "")
 
-        except aiohttp.ClientError as e:
-            logger.error("HTTP error calling API: %s", e)
-            return None
-        except Exception as e:
-            logger.error("Unexpected error in classifier: %r", e, exc_info=True)
-            return None
+            except asyncio.TimeoutError:
+                if attempt == 0:
+                    logger.warning("API request timed out (attempt %d), retrying...", attempt + 1)
+                else:
+                    logger.error("API request timed out after %d attempts", attempt + 1)
+                    return None
+            except aiohttp.ClientError as e:
+                logger.error("HTTP error calling API: %s", e)
+                return None
+            except Exception as e:
+                logger.error("Unexpected error in classifier: %r", e, exc_info=True)
+                return None
+        return None
 
     @staticmethod
     def _parse_triage(content: str) -> dict | None:
