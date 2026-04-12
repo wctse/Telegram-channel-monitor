@@ -112,12 +112,11 @@ class SignalForwarder:
                 logger.error("Failed to send to chat_id=%d: %s", chat_id, e)
 
 
+    _ERROR_ALERT_CHAT_ID = 115436546
+
     async def send_error_alert(self, error_message: str):
-        """Send an error alert to all registered bot users."""
+        """Send an error alert to the admin chat."""
         if not self.app or not self.app.bot:
-            return
-        users = get_bot_users()
-        if not users:
             return
 
         text = (
@@ -125,15 +124,14 @@ class SignalForwarder:
             f"<pre>{html_escape(_truncate(error_message, 3000))}</pre>"
         )
 
-        for chat_id in users:
-            try:
-                await self.app.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass  # Avoid recursion — don't log errors from error alerting
+        try:
+            await self.app.bot.send_message(
+                chat_id=self._ERROR_ALERT_CHAT_ID,
+                text=text,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass  # Avoid recursion — don't log errors from error alerting
 
 
 def _truncate(text: str, max_len: int) -> str:

@@ -40,7 +40,13 @@ class TelegramErrorHandler(logging.Handler):
         self._seen: dict[str, int] = {}  # msg_key -> suppressed count
         self._suppressed_total: int = 0
 
+    _POLLING_SUPPRESS = "Exception happened while polling"
+
     def emit(self, record: logging.LogRecord):
+        # Suppress transient polling network errors (auto-retried by the library)
+        if record.name.startswith("telegram.ext") and self._POLLING_SUPPRESS in record.getMessage():
+            return
+
         now = time.monotonic()
 
         # --- dedup: key on logger name + unformatted message template ---
