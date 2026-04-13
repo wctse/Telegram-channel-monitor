@@ -155,6 +155,7 @@ async def main():
         enrich_prompt=classifier_conf.get("enrich_prompt", "Analyze the signal in detail."),
         api_key=api_key,
         timeout=llm_conf.get("timeout", 120),
+        fallback_model=llm_conf.get("fallback_model"),
     )
 
     # Init forwarder bot

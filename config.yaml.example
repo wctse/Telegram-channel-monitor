@@ -18,6 +18,7 @@ llm:
   provider: "api"  # or "ollama"
   base_url: "https://openrouter.ai/api/v1"  # or http://localhost:11434 for ollama
   model: "qwen/qwen3.5-9b"  # OpenRouter model name, or e.g. "qwen3:4b" for ollama
+  fallback_model: "minimax/minimax-m2.5"  # Optional: used if primary model fails
   timeout: 120
 
 error_alerts:

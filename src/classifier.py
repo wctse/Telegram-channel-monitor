@@ -18,10 +18,12 @@ class LLMClassifier:
         enrich_prompt: str,
         api_key: str | None = None,
         timeout: int = 120,
+        fallback_model: str | None = None,
     ):
         self.provider = provider  # "ollama" or "api"
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.fallback_model = fallback_model
         self.triage_prompt = triage_prompt
         self.enrich_prompt = enrich_prompt
         self.api_key = api_key
@@ -122,12 +124,21 @@ class LLMClassifier:
         return None
 
     async def _call_api(self, system_prompt: str, user_content: str) -> str | None:
+        result = await self._call_api_with_model(self.model, system_prompt, user_content)
+        if result is not None:
+            return result
+        if self.fallback_model:
+            logger.warning("Primary model %s failed, falling back to %s", self.model, self.fallback_model)
+            return await self._call_api_with_model(self.fallback_model, system_prompt, user_content)
+        return None
+
+    async def _call_api_with_model(self, model: str, system_prompt: str, user_content: str) -> str | None:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         payload = {
-            "model": self.model,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
@@ -145,32 +156,32 @@ class LLMClassifier:
                     headers=headers,
                 ) as resp:
                     if resp.status != 200:
-                        logger.error("API error: %s", await resp.text())
+                        logger.error("API error (model=%s): %s", model, await resp.text())
                         return None
 
                     data = await resp.json()
                     if not isinstance(data, dict):
-                        logger.warning("API returned non-dict response (attempt %d): %s", attempt + 1, data)
+                        logger.warning("API returned non-dict response (model=%s, attempt %d): %s", model, attempt + 1, data)
                         continue
                     choices = data.get("choices")
                     if not choices or not isinstance(choices, list):
-                        logger.warning("Malformed API response (attempt %d): missing 'choices'. Body: %s", attempt + 1, data)
+                        logger.warning("Malformed API response (model=%s, attempt %d): missing 'choices'. Body: %s", model, attempt + 1, data)
                         continue
                     return choices[0].get("message", {}).get("content", "")
 
             except asyncio.TimeoutError:
                 if attempt == 0:
-                    logger.warning("API request timed out (attempt %d), retrying...", attempt + 1)
+                    logger.warning("API request timed out (model=%s, attempt %d), retrying...", model, attempt + 1)
                 else:
-                    logger.error("API request timed out after %d attempts", attempt + 1)
+                    logger.error("API request timed out (model=%s) after %d attempts", model, attempt + 1)
                     return None
             except aiohttp.ClientError as e:
-                logger.warning("HTTP error calling API (attempt %d): %s", attempt + 1, e)
+                logger.warning("HTTP error calling API (model=%s, attempt %d): %s", model, attempt + 1, e)
             except Exception as e:
-                logger.error("Unexpected error in classifier: %r", e, exc_info=True)
+                logger.error("Unexpected error in classifier (model=%s): %r", model, e, exc_info=True)
                 return None
 
-        logger.error("API call failed after %d attempts", attempt + 1)
+        logger.error("API call failed (model=%s) after %d attempts", model, attempt + 1)
         return None
 
     @staticmethod
