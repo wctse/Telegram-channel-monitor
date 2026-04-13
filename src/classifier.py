@@ -149,10 +149,13 @@ class LLMClassifier:
                         return None
 
                     data = await resp.json()
+                    if not isinstance(data, dict):
+                        logger.warning("API returned non-dict response (attempt %d): %s", attempt + 1, data)
+                        continue
                     choices = data.get("choices")
                     if not choices or not isinstance(choices, list):
-                        logger.error("Malformed API response: missing 'choices'. Body: %s", data)
-                        return None
+                        logger.warning("Malformed API response (attempt %d): missing 'choices'. Body: %s", attempt + 1, data)
+                        continue
                     return choices[0].get("message", {}).get("content", "")
 
             except asyncio.TimeoutError:
@@ -162,11 +165,12 @@ class LLMClassifier:
                     logger.error("API request timed out after %d attempts", attempt + 1)
                     return None
             except aiohttp.ClientError as e:
-                logger.error("HTTP error calling API: %s", e)
-                return None
+                logger.warning("HTTP error calling API (attempt %d): %s", attempt + 1, e)
             except Exception as e:
                 logger.error("Unexpected error in classifier: %r", e, exc_info=True)
                 return None
+
+        logger.error("API call failed after %d attempts", attempt + 1)
         return None
 
     @staticmethod
