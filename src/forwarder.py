@@ -4,7 +4,7 @@ from html import escape as html_escape
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from src.db import save_bot_user, get_bot_users
+from src.db import save_bot_user, get_bot_users, update_forwarded_signal
 
 
 def _load_allowed_chat_ids() -> set[int]:
@@ -70,12 +70,8 @@ class SignalForwarder:
             f"- Your chat ID: {chat_id}"
         )
 
-    async def forward_signal(self, classification: dict, original_text: str, channel_name: str):
-        users = get_bot_users()
-        if not users:
-            logger.warning("No registered bot users to forward to")
-            return
-
+    @staticmethod
+    def _render_signal_message(classification: dict, original_texts: list[str], channel_name: str) -> str:
         raw_tickers = classification.get("tickers", [])
         confidence = classification.get("confidence", 0.0)
         category = classification.get("category", "unknown")
@@ -92,24 +88,67 @@ class SignalForwarder:
                 ticker_lines.append(f"  ⚪ <b>{html_escape(str(t))}</b> — NEUTRAL")
         tickers_block = "\n".join(ticker_lines) if ticker_lines else "  None"
 
-        message = (
+        if len(original_texts) == 1:
+            originals_block = html_escape(_truncate(original_texts[0], 800))
+        else:
+            parts = []
+            per_msg_limit = max(200, 800 // len(original_texts))
+            for i, t in enumerate(original_texts, 1):
+                parts.append(f"[{i}] {html_escape(_truncate(t, per_msg_limit))}")
+            originals_block = "\n\n".join(parts)
+
+        msg_label = "Original messages" if len(original_texts) > 1 else "Original message"
+        return (
             f"🔔 <b>Signal Detected</b> — {html_escape(channel_name)}\n\n"
             f"<b>Category:</b> {html_escape(category)}\n"
             f"<b>Confidence:</b> {confidence:.0%}\n\n"
             f"<b>Tickers:</b>\n{tickers_block}\n\n"
             f"<b>Why:</b>\n{html_escape(thesis)}\n\n"
-            f"<b>Original message:</b>\n<blockquote>{html_escape(_truncate(original_text, 800))}</blockquote>"
+            f"<b>{msg_label}:</b>\n<blockquote>{originals_block}</blockquote>"
         )
 
+    async def forward_signal(self, classification: dict, original_text: str, channel_name: str) -> dict[int, int]:
+        """Send signal to all bot users. Returns {chat_id: message_id} for sent messages."""
+        users = get_bot_users()
+        if not users:
+            logger.warning("No registered bot users to forward to")
+            return {}
+
+        message = self._render_signal_message(classification, [original_text], channel_name)
+        sent = {}
         for chat_id in users:
             try:
-                await self.app.bot.send_message(
+                msg = await self.app.bot.send_message(
                     chat_id=chat_id,
                     text=message,
                     parse_mode="HTML",
                 )
+                sent[chat_id] = msg.message_id
             except Exception as e:
                 logger.error("Failed to send to chat_id=%d: %s", chat_id, e)
+        return sent
+
+    async def update_signal_message(
+        self,
+        signal_id: int,
+        bot_message_ids: dict,
+        classification: dict,
+        original_texts: list[str],
+        channel_name: str,
+    ):
+        """Edit existing bot messages with updated thesis/reasons."""
+        message = self._render_signal_message(classification, original_texts, channel_name)
+        for chat_id_str, msg_id in bot_message_ids.items():
+            try:
+                await self.app.bot.edit_message_text(
+                    chat_id=int(chat_id_str),
+                    message_id=msg_id,
+                    text=message,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error("Failed to edit message for chat_id=%s: %s", chat_id_str, e)
+        update_forwarded_signal(signal_id, classification.get("thesis", ""), original_texts)
 
 
     _ERROR_ALERT_CHAT_ID = 115436546

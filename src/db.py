@@ -46,6 +46,25 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id);
         CREATE INDEX IF NOT EXISTS idx_messages_signal ON messages(is_signal);
         CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+
+        CREATE TABLE IF NOT EXISTS forwarded_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_key TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            channel_name TEXT,
+            signal_date TEXT NOT NULL,
+            tickers TEXT NOT NULL,
+            thesis TEXT,
+            original_texts TEXT,
+            bot_message_ids TEXT,
+            confidence REAL,
+            category TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_forwarded_signals_lookup
+            ON forwarded_signals(sender_key, signal_date);
     """)
     conn.commit()
     conn.close()
@@ -129,6 +148,90 @@ def get_recent_messages(channel_id: int, lookback_minutes: int = 30, limit: int 
             """,
             (channel_id, f"-{lookback_minutes}", limit),
         ).fetchall()
+        return [row["text"] for row in rows if row["text"]]
+    finally:
+        conn.close()
+
+
+def get_forwarded_signals_today(sender_key: str, signal_date: str) -> list[dict]:
+    """Get all forwarded signals from this sender on this date."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM forwarded_signals WHERE sender_key = ? AND signal_date = ?",
+            (sender_key, signal_date),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def save_forwarded_signal(
+    sender_key: str,
+    channel_id: int,
+    channel_name: str,
+    signal_date: str,
+    tickers: list[dict],
+    thesis: str,
+    original_texts: list[str],
+    bot_message_ids: dict,
+    confidence: float,
+    category: str,
+) -> int:
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """INSERT INTO forwarded_signals
+               (sender_key, channel_id, channel_name, signal_date, tickers, thesis,
+                original_texts, bot_message_ids, confidence, category)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                sender_key, channel_id, channel_name, signal_date,
+                json.dumps(tickers), thesis, json.dumps(original_texts),
+                json.dumps(bot_message_ids), confidence, category,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def update_forwarded_signal(signal_id: int, thesis: str, original_texts: list[str]):
+    """Update thesis and original texts for an existing forwarded signal."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            """UPDATE forwarded_signals
+               SET thesis = ?, original_texts = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (thesis, json.dumps(original_texts), signal_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_sender_messages_today(sender_id: int | None, channel_id: int) -> list[str]:
+    """Get messages from the same sender in this channel today (UTC)."""
+    conn = get_connection()
+    try:
+        if sender_id is not None:
+            rows = conn.execute(
+                """SELECT text FROM messages
+                   WHERE channel_id = ? AND sender_id = ?
+                     AND date(timestamp) = date('now')
+                   ORDER BY timestamp ASC""",
+                (channel_id, sender_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT text FROM messages
+                   WHERE channel_id = ?
+                     AND date(timestamp) = date('now')
+                   ORDER BY timestamp ASC""",
+                (channel_id,),
+            ).fetchall()
         return [row["text"] for row in rows if row["text"]]
     finally:
         conn.close()

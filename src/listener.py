@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import logging
 import sqlite3
@@ -9,7 +10,7 @@ from telethon import TelegramClient, events
 
 from src.classifier import LLMClassifier
 from src.forwarder import SignalForwarder
-from src.db import save_message, get_recent_messages
+from src.db import save_message, get_recent_messages, get_sender_messages_today, get_forwarded_signals_today, save_forwarded_signal, update_forwarded_signal
 
 logger = logging.getLogger(__name__)
 
@@ -291,10 +292,11 @@ class ChannelListener:
             logger.info("⬜ NOISE (%.0f%% confidence) in %s | Category: %s", conf * 100, channel_name, cat)
             return
 
-        # Stage 2: Enrich — pull context and synthesize full analysis
+        # Stage 2: Enrich — pull context and sender history for full synthesis
         logger.info("🔍 Signal detected in '%s', enriching with %d-min context...", channel_name, lookback)
         context_texts = get_recent_messages(matched_id, lookback_minutes=lookback)
-        enriched = await self.classifier.enrich(text, context_texts)
+        sender_history = get_sender_messages_today(sender_id, matched_id)
+        enriched = await self.classifier.enrich(text, context_texts, sender_history_texts=sender_history)
 
         if enriched and enriched.get("is_signal") and enriched.get("confidence", 0) >= threshold:
             # Update DB record with enriched classification
@@ -308,13 +310,92 @@ class ChannelListener:
                 timestamp=timestamp,
                 classification=enriched,
             )
-            logger.info(
-                "🔔 SIGNAL (%.0f%% confidence) in %s: %s",
-                enriched["confidence"] * 100,
-                channel_name,
-                enriched.get("thesis", "")[:150],
-            )
-            await self.forwarder.forward_signal(enriched, text, channel_name)
+
+            # Throttle check: same sender + same day + same ticker + same side
+            sender_key = str(sender_id) if sender_id else f"ch_{matched_id}"
+            signal_date = timestamp.strftime("%Y-%m-%d")
+            enriched_tickers = enriched.get("tickers", [])
+
+            existing_signals = get_forwarded_signals_today(sender_key, signal_date)
+            already_forwarded = set()
+            for sig in existing_signals:
+                try:
+                    for t in json.loads(sig["tickers"]):
+                        already_forwarded.add((t["symbol"].upper(), t["bias"].lower()))
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            new_combos = [
+                t for t in enriched_tickers
+                if (t.get("symbol", "").upper(), t.get("bias", "neutral").lower()) not in already_forwarded
+            ]
+
+            if new_combos:
+                # At least one new ticker+bias — forward as new signal
+                logger.info(
+                    "🔔 SIGNAL (%.0f%% confidence) in %s: %s",
+                    enriched["confidence"] * 100,
+                    channel_name,
+                    enriched.get("thesis", "")[:150],
+                )
+                bot_msg_ids = await self.forwarder.forward_signal(enriched, text, channel_name)
+                save_forwarded_signal(
+                    sender_key=sender_key,
+                    channel_id=matched_id,
+                    channel_name=channel_name,
+                    signal_date=signal_date,
+                    tickers=enriched_tickers,
+                    thesis=enriched.get("thesis", ""),
+                    original_texts=[text],
+                    bot_message_ids={str(k): v for k, v in bot_msg_ids.items()},
+                    confidence=enriched.get("confidence", 0),
+                    category=enriched.get("category", ""),
+                )
+            else:
+                # All ticker+bias combos already forwarded today — throttle
+                logger.info(
+                    "🔇 Throttled signal from sender=%s in %s (all ticker+bias already forwarded today)",
+                    sender_key, channel_name,
+                )
+                # Find the best matching existing signal to update
+                new_thesis = enriched.get("thesis", "")
+                best_match = self._find_best_matching_signal(existing_signals, enriched_tickers)
+                if best_match and new_thesis and new_thesis != best_match.get("thesis", ""):
+                    old_texts = json.loads(best_match.get("original_texts", "[]"))
+                    old_texts.append(text)
+                    bot_msg_ids = json.loads(best_match.get("bot_message_ids", "{}"))
+                    updated_classification = {
+                        "tickers": json.loads(best_match["tickers"]),
+                        "confidence": enriched.get("confidence", 0),
+                        "category": best_match.get("category", ""),
+                        "thesis": new_thesis,
+                    }
+                    if bot_msg_ids:
+                        await self.forwarder.update_signal_message(
+                            best_match["id"], bot_msg_ids, updated_classification,
+                            old_texts, best_match.get("channel_name", channel_name),
+                        )
+                        logger.info("📝 Updated throttled signal (id=%d) with new thesis", best_match["id"])
+                    else:
+                        update_forwarded_signal(best_match["id"], new_thesis, old_texts)
+                        logger.info("📝 Updated thesis for throttled signal (id=%d), no bot messages to edit", best_match["id"])
         else:
             conf = enriched.get("confidence", 0) if enriched else 0
             logger.info("⬜ Enrichment downgraded signal in %s (%.0f%% confidence)", channel_name, conf * 100)
+
+    @staticmethod
+    def _find_best_matching_signal(existing_signals: list[dict], tickers: list[dict]) -> dict | None:
+        """Find the existing forwarded signal with the most ticker overlap."""
+        target = {(t.get("symbol", "").upper(), t.get("bias", "neutral").lower()) for t in tickers}
+        best = None
+        best_overlap = 0
+        for sig in existing_signals:
+            try:
+                sig_tickers = {(t["symbol"].upper(), t["bias"].lower()) for t in json.loads(sig["tickers"])}
+            except (json.JSONDecodeError, KeyError):
+                continue
+            overlap = len(target & sig_tickers)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best = sig
+        return best

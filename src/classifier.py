@@ -57,9 +57,14 @@ class LLMClassifier:
             return None
         return self._parse_triage(raw)
 
-    async def enrich(self, signal_text: str, context_texts: list[str]) -> dict | None:
+    async def enrich(self, signal_text: str, context_texts: list[str], sender_history_texts: list[str] | None = None) -> dict | None:
         """Stage 2: Given a signal message and surrounding context, produce a full synthesis."""
         parts = []
+        if sender_history_texts:
+            parts.append("PREVIOUS MESSAGES FROM THIS SENDER TODAY (oldest first):")
+            for i, t in enumerate(sender_history_texts, 1):
+                parts.append(f"--- sender message {i} ---\n{t}")
+            parts.append("")
         if context_texts:
             parts.append("RECENT CONTEXT FROM THIS CHANNEL (oldest first):")
             for i, t in enumerate(context_texts, 1):

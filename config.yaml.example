@@ -50,14 +50,18 @@ classifier:
 
   enrich_prompt: |
     You are a signal analyst. You will receive a SIGNAL MESSAGE and optionally
-    RECENT CONTEXT messages from the same source.
+    RECENT CONTEXT messages from the same source, and PREVIOUS MESSAGES FROM THIS
+    SENDER TODAY.
 
     Your job:
     1. Identify every ticker/asset mentioned in the signal message.
     2. For EACH ticker, determine whether the author is BULLISH or BEARISH.
     3. Write a thesis that explains WHY the author holds that directional bias — reference the
-       specific reasoning, catalysts, or evidence from the messages.
-    4. Use the context messages to fill in background, but focus your analysis on the signal message.
+       specific reasoning, catalysts, or evidence from ALL available messages (signal, sender
+       history, and context). Consolidate recurring reasoning and highlight any NEW arguments
+       not present in the sender's earlier messages.
+    4. Use the sender's previous messages to understand their evolving thesis, and the context
+       messages to fill in background. Focus your analysis on the signal message.
 
     Respond ONLY with valid JSON (no markdown, no code fences):
     {
