@@ -71,21 +71,53 @@ class SignalForwarder:
         )
 
     @staticmethod
+    def _bias_icon(bias: str) -> str:
+        return "🟢" if bias == "bullish" else "🔴" if bias == "bearish" else "⚪"
+
+    @staticmethod
+    def _category_icon(category: str) -> str:
+        return {
+            "trade_idea": "💡",
+            "macro": "🌐",
+            "fundamental": "📊",
+            "risk_warning": "⚠️",
+        }.get(category, "🔔")
+
+    @staticmethod
+    def _timeframe_icon(timeframe: str) -> str:
+        return {
+            "minutes": "⚡",
+            "hours": "⏱",
+            "days": "📅",
+            "weeks": "🗓",
+        }.get(timeframe, "❔")
+
+    @staticmethod
     def _render_signal_message(classification: dict, original_texts: list[str], channel_name: str) -> str:
         raw_tickers = classification.get("tickers", [])
         confidence = classification.get("confidence", 0.0)
         category = classification.get("category", "unknown")
+        timeframe = classification.get("timeframe", "") or "unspecified"
         thesis = classification.get("thesis", "")
 
-        ticker_lines = []
+        normalized = []
         for t in raw_tickers:
             if isinstance(t, dict):
-                symbol = html_escape(str(t.get("symbol", "?")))
-                bias = t.get("bias", "neutral").lower()
-                icon = "🟢" if bias == "bullish" else "🔴" if bias == "bearish" else "⚪"
-                ticker_lines.append(f"  {icon} <b>{symbol}</b> — {bias.upper()}")
+                normalized.append((str(t.get("symbol", "?")), t.get("bias", "neutral").lower()))
             else:
-                ticker_lines.append(f"  ⚪ <b>{html_escape(str(t))}</b> — NEUTRAL")
+                normalized.append((str(t), "neutral"))
+
+        # Header ticker summary: up to 3 inline, rest as +N
+        summary_parts = [f"{TelegramForwarder._bias_icon(b)} {html_escape(s)}" for s, b in normalized[:3]]
+        if len(normalized) > 3:
+            summary_parts.append(f"+{len(normalized) - 3}")
+        ticker_summary = " ".join(summary_parts) if summary_parts else "—"
+
+        # Body ticker list (no redundant BULLISH/BEARISH label — dot conveys it)
+        ticker_lines = [
+            f"  {TelegramForwarder._bias_icon(b)} <b>{html_escape(s)}</b>"
+            for s, b in normalized
+        ]
         tickers_block = "\n".join(ticker_lines) if ticker_lines else "  None"
 
         if len(original_texts) == 1:
@@ -97,10 +129,14 @@ class SignalForwarder:
                 parts.append(f"[{i}] {html_escape(_truncate(t, per_msg_limit))}")
             originals_block = "\n\n".join(parts)
 
+        cat_icon = TelegramForwarder._category_icon(category)
+        tf_icon = TelegramForwarder._timeframe_icon(timeframe)
+
         msg_label = "Original messages" if len(original_texts) > 1 else "Original message"
         return (
-            f"🔔 <b>Signal Detected</b> — {html_escape(channel_name)}\n\n"
+            f"{cat_icon} {ticker_summary} · {tf_icon} {html_escape(timeframe)} — {html_escape(channel_name)}\n\n"
             f"<b>Category:</b> {html_escape(category)}\n"
+            f"<b>Timeframe:</b> {tf_icon} {html_escape(timeframe)}\n"
             f"<b>Confidence:</b> {confidence:.0%}\n\n"
             f"<b>Tickers:</b>\n{tickers_block}\n\n"
             f"<b>Why:</b>\n{html_escape(thesis)}\n\n"

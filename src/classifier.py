@@ -216,11 +216,15 @@ class LLMClassifier:
                     })
                 else:
                     tickers.append({"symbol": str(t), "bias": "neutral"})
+            timeframe = str(result.get("timeframe", "")).lower().strip()
+            if timeframe not in ("minutes", "hours", "days", "weeks"):
+                timeframe = ""
             return {
                 "is_signal": bool(result.get("is_signal", False)),
                 "confidence": float(result.get("confidence", 0.0)),
                 "thesis": str(result.get("thesis", "")),
                 "tickers": tickers,
+                "timeframe": timeframe,
                 "category": str(result.get("category", "noise")),
             }
         except (json.JSONDecodeError, ValueError) as e:
