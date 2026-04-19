@@ -134,20 +134,27 @@ def save_bot_user(chat_id: int, username: str | None, first_name: str | None):
         conn.close()
 
 
-def get_recent_messages(channel_id: int, lookback_minutes: int = 30, limit: int = 50) -> list[str]:
+def get_recent_messages(
+    channel_id: int,
+    lookback_minutes: int = 30,
+    limit: int = 50,
+    exclude_message_ids: list[int] | None = None,
+) -> list[str]:
     """Retrieve recent message texts from a channel within the lookback window."""
     conn = get_connection()
     try:
-        rows = conn.execute(
-            """
-            SELECT text FROM messages
-            WHERE channel_id = ?
-              AND timestamp >= datetime('now', ? || ' minutes')
-            ORDER BY timestamp ASC
-            LIMIT ?
-            """,
-            (channel_id, f"-{lookback_minutes}", limit),
-        ).fetchall()
+        query = (
+            "SELECT text FROM messages "
+            "WHERE channel_id = ? AND timestamp >= datetime('now', ? || ' minutes')"
+        )
+        params: list = [channel_id, f"-{lookback_minutes}"]
+        if exclude_message_ids:
+            placeholders = ",".join("?" * len(exclude_message_ids))
+            query += f" AND message_id NOT IN ({placeholders})"
+            params.extend(exclude_message_ids)
+        query += " ORDER BY timestamp ASC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
         return [row["text"] for row in rows if row["text"]]
     finally:
         conn.close()
@@ -212,26 +219,32 @@ def update_forwarded_signal(signal_id: int, thesis: str, original_texts: list[st
         conn.close()
 
 
-def get_sender_messages_today(sender_id: int | None, channel_id: int) -> list[str]:
+def get_sender_messages_today(
+    sender_id: int | None,
+    channel_id: int,
+    exclude_message_ids: list[int] | None = None,
+) -> list[str]:
     """Get messages from the same sender in this channel today (UTC)."""
     conn = get_connection()
     try:
         if sender_id is not None:
-            rows = conn.execute(
-                """SELECT text FROM messages
-                   WHERE channel_id = ? AND sender_id = ?
-                     AND date(timestamp) = date('now')
-                   ORDER BY timestamp ASC""",
-                (channel_id, sender_id),
-            ).fetchall()
+            query = (
+                "SELECT text FROM messages "
+                "WHERE channel_id = ? AND sender_id = ? AND date(timestamp) = date('now')"
+            )
+            params: list = [channel_id, sender_id]
         else:
-            rows = conn.execute(
-                """SELECT text FROM messages
-                   WHERE channel_id = ?
-                     AND date(timestamp) = date('now')
-                   ORDER BY timestamp ASC""",
-                (channel_id,),
-            ).fetchall()
+            query = (
+                "SELECT text FROM messages "
+                "WHERE channel_id = ? AND date(timestamp) = date('now')"
+            )
+            params = [channel_id]
+        if exclude_message_ids:
+            placeholders = ",".join("?" * len(exclude_message_ids))
+            query += f" AND message_id NOT IN ({placeholders})"
+            params.extend(exclude_message_ids)
+        query += " ORDER BY timestamp ASC"
+        rows = conn.execute(query, params).fetchall()
         return [row["text"] for row in rows if row["text"]]
     finally:
         conn.close()

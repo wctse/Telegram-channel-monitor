@@ -108,14 +108,14 @@ class SignalForwarder:
                 normalized.append((str(t), "neutral"))
 
         # Header ticker summary: up to 3 inline, rest as +N
-        summary_parts = [f"{TelegramForwarder._bias_icon(b)} {html_escape(s)}" for s, b in normalized[:3]]
+        summary_parts = [f"{SignalForwarder._bias_icon(b)} {html_escape(s)}" for s, b in normalized[:3]]
         if len(normalized) > 3:
             summary_parts.append(f"+{len(normalized) - 3}")
         ticker_summary = " ".join(summary_parts) if summary_parts else "—"
 
         # Body ticker list (no redundant BULLISH/BEARISH label — dot conveys it)
         ticker_lines = [
-            f"  {TelegramForwarder._bias_icon(b)} <b>{html_escape(s)}</b>"
+            f"  {SignalForwarder._bias_icon(b)} <b>{html_escape(s)}</b>"
             for s, b in normalized
         ]
         tickers_block = "\n".join(ticker_lines) if ticker_lines else "  None"
@@ -129,8 +129,8 @@ class SignalForwarder:
                 parts.append(f"[{i}] {html_escape(_truncate(t, per_msg_limit))}")
             originals_block = "\n\n".join(parts)
 
-        cat_icon = TelegramForwarder._category_icon(category)
-        tf_icon = TelegramForwarder._timeframe_icon(timeframe)
+        cat_icon = SignalForwarder._category_icon(category)
+        tf_icon = SignalForwarder._timeframe_icon(timeframe)
 
         msg_label = "Original messages" if len(original_texts) > 1 else "Original message"
         return (
@@ -143,14 +143,23 @@ class SignalForwarder:
             f"<b>{msg_label}:</b>\n<blockquote>{originals_block}</blockquote>"
         )
 
-    async def forward_signal(self, classification: dict, original_text: str, channel_name: str) -> dict[int, int]:
-        """Send signal to all bot users. Returns {chat_id: message_id} for sent messages."""
+    async def forward_signal(
+        self,
+        classification: dict,
+        original_text: str | list[str],
+        channel_name: str,
+    ) -> dict[int, int]:
+        """Send signal to all bot users. Returns {chat_id: message_id} for sent messages.
+
+        `original_text` may be a single string or a list of strings (batched messages).
+        """
         users = get_bot_users()
         if not users:
             logger.warning("No registered bot users to forward to")
             return {}
 
-        message = self._render_signal_message(classification, [original_text], channel_name)
+        original_texts = original_text if isinstance(original_text, list) else [original_text]
+        message = self._render_signal_message(classification, original_texts, channel_name)
         sent = {}
         for chat_id in users:
             try:

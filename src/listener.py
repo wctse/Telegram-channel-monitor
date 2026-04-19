@@ -49,6 +49,11 @@ class ChannelListener:
         self._raw_update_counts: dict[str, int] = {}
         self._last_heartbeat: float = 0.0
         self._heartbeat_interval: float = 3600.0
+        # Message batching: group messages from the same (channel, sender) if the
+        # channel has `batch_delay_seconds` set, so one-idea-split-across-messages
+        # senders get a single combined LLM call.
+        self._batches: dict[tuple[int, int | None], dict] = {}
+        self._batch_lock = asyncio.Lock()
 
     async def start(self):
         self._stopping = False
@@ -241,13 +246,13 @@ class ChannelListener:
         raw_id = event.chat_id
         if raw_id is None:
             return
-            
+
         # Try to find a match in our config using both raw and normalized IDs
         norm_id = self._normalize_id(raw_id)
-        
+
         ch_conf = None
         matched_id = None
-        
+
         for cfg_id, conf in self._channel_map.items():
             if self._normalize_id(cfg_id) == norm_id:
                 ch_conf = conf
@@ -258,8 +263,6 @@ class ChannelListener:
             return  # Message is from an unmonitored channel
 
         channel_name = ch_conf.get("name", str(matched_id))
-        threshold = ch_conf.get("confidence_threshold", 0.7)
-        lookback = ch_conf.get("context_lookback_minutes", 30)
 
         sender_id = None
         sender_name = None
@@ -270,11 +273,16 @@ class ChannelListener:
             )
         timestamp = msg.date or datetime.now(timezone.utc)
 
-        # Stage 1: Triage — quick signal/noise check
-        logger.info("📥 Triaging message from '%s': %.80s...", channel_name, text.replace('\n', ' '))
-        triage_result = await self.classifier.triage(text)
+        entry = {
+            "message_id": msg.id,
+            "text": text,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "timestamp": timestamp,
+        }
 
-        # Save to DB with triage result
+        # Persist the raw message immediately so it's available as future context,
+        # even if batching delays classification.
         save_message(
             channel_id=matched_id,
             channel_name=channel_name,
@@ -283,105 +291,209 @@ class ChannelListener:
             sender_name=sender_name,
             text=text,
             timestamp=timestamp,
-            classification=triage_result,
+            classification=None,
         )
 
-        if not triage_result or not triage_result.get("is_signal") or triage_result.get("confidence", 0) < threshold:
+        batch_delay = ch_conf.get("batch_delay_seconds", 0) or 0
+        if batch_delay > 0:
+            await self._enqueue_batch(matched_id, ch_conf, channel_name, entry, float(batch_delay))
+            logger.info(
+                "🗂️  Buffered message from '%s' (waiting %ds for more): %.60s...",
+                channel_name, batch_delay, text.replace('\n', ' '),
+            )
+            return
+
+        await self._process_entries(matched_id, ch_conf, channel_name, [entry])
+
+    async def _enqueue_batch(
+        self,
+        channel_id: int,
+        ch_conf: dict,
+        channel_name: str,
+        entry: dict,
+        delay: float,
+    ):
+        key = (channel_id, entry["sender_id"])
+        async with self._batch_lock:
+            batch = self._batches.get(key)
+            if batch is None:
+                batch = {
+                    "entries": [],
+                    "channel_id": channel_id,
+                    "ch_conf": ch_conf,
+                    "channel_name": channel_name,
+                    "task": None,
+                }
+                self._batches[key] = batch
+            batch["entries"].append(entry)
+            if batch["task"] and not batch["task"].done():
+                batch["task"].cancel()
+            batch["task"] = asyncio.create_task(self._flush_batch_after(key, delay))
+
+    async def _flush_batch_after(self, key: tuple[int, int | None], delay: float):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        async with self._batch_lock:
+            batch = self._batches.pop(key, None)
+        if not batch or not batch["entries"]:
+            return
+        try:
+            await self._process_entries(
+                batch["channel_id"],
+                batch["ch_conf"],
+                batch["channel_name"],
+                batch["entries"],
+            )
+        except Exception as e:
+            logger.error("Error processing batched messages for %s: %r", key, e, exc_info=True)
+
+    async def _process_entries(
+        self,
+        channel_id: int,
+        ch_conf: dict,
+        channel_name: str,
+        entries: list[dict],
+    ):
+        threshold = ch_conf.get("confidence_threshold", 0.7)
+        lookback = ch_conf.get("context_lookback_minutes", 30)
+
+        batch_ids = [e["message_id"] for e in entries]
+        last = entries[-1]
+        sender_id = last["sender_id"]
+        sender_name = last["sender_name"]
+        timestamp = last["timestamp"]
+        original_texts = [e["text"] for e in entries]
+        combined_text = original_texts[0] if len(entries) == 1 else "\n\n".join(original_texts)
+
+        label = f"batched {len(entries)} message(s)" if len(entries) > 1 else "message"
+        logger.info("📥 Triaging %s from '%s': %.80s...",
+                    label, channel_name, combined_text.replace('\n', ' '))
+        triage_result = await self.classifier.triage(combined_text)
+
+        # Persist triage outcome on each message in the batch
+        for e in entries:
+            save_message(
+                channel_id=channel_id,
+                channel_name=channel_name,
+                message_id=e["message_id"],
+                sender_id=e["sender_id"],
+                sender_name=e["sender_name"],
+                text=e["text"],
+                timestamp=e["timestamp"],
+                classification=triage_result,
+            )
+
+        if (
+            not triage_result
+            or not triage_result.get("is_signal")
+            or triage_result.get("confidence", 0) < threshold
+        ):
             conf = triage_result.get("confidence", 0) if triage_result else 0
             cat = triage_result.get("category", "error") if triage_result else "error"
             logger.info("⬜ NOISE (%.0f%% confidence) in %s | Category: %s", conf * 100, channel_name, cat)
             return
 
-        # Stage 2: Enrich — pull context and sender history for full synthesis
+        # Stage 2: Enrich — pull context and sender history for full synthesis.
+        # Exclude the batched messages themselves so we don't feed them to the LLM
+        # twice (they're already in `combined_text`).
         logger.info("🔍 Signal detected in '%s', enriching with %d-min context...", channel_name, lookback)
-        context_texts = get_recent_messages(matched_id, lookback_minutes=lookback)
-        sender_history = get_sender_messages_today(sender_id, matched_id)
-        enriched = await self.classifier.enrich(text, context_texts, sender_history_texts=sender_history)
+        context_texts = get_recent_messages(
+            channel_id, lookback_minutes=lookback, exclude_message_ids=batch_ids,
+        )
+        sender_history = get_sender_messages_today(
+            sender_id, channel_id, exclude_message_ids=batch_ids,
+        )
+        enriched = await self.classifier.enrich(
+            combined_text, context_texts, sender_history_texts=sender_history,
+        )
 
-        if enriched and enriched.get("is_signal") and enriched.get("confidence", 0) >= threshold:
-            # Update DB record with enriched classification
+        if not (enriched and enriched.get("is_signal") and enriched.get("confidence", 0) >= threshold):
+            conf = enriched.get("confidence", 0) if enriched else 0
+            logger.info("⬜ Enrichment downgraded signal in %s (%.0f%% confidence)", channel_name, conf * 100)
+            return
+
+        # Update DB records with enriched classification
+        for e in entries:
             save_message(
-                channel_id=matched_id,
+                channel_id=channel_id,
                 channel_name=channel_name,
-                message_id=msg.id,
-                sender_id=sender_id,
-                sender_name=sender_name,
-                text=text,
-                timestamp=timestamp,
+                message_id=e["message_id"],
+                sender_id=e["sender_id"],
+                sender_name=e["sender_name"],
+                text=e["text"],
+                timestamp=e["timestamp"],
                 classification=enriched,
             )
 
-            # Throttle check: same sender + same day + same ticker + same side
-            sender_key = str(sender_id) if sender_id else f"ch_{matched_id}"
-            signal_date = timestamp.strftime("%Y-%m-%d")
-            enriched_tickers = enriched.get("tickers", [])
+        # Throttle check: same sender + same day + same ticker + same side
+        sender_key = str(sender_id) if sender_id else f"ch_{channel_id}"
+        signal_date = timestamp.strftime("%Y-%m-%d")
+        enriched_tickers = enriched.get("tickers", [])
 
-            existing_signals = get_forwarded_signals_today(sender_key, signal_date)
-            already_forwarded = set()
-            for sig in existing_signals:
-                try:
-                    for t in json.loads(sig["tickers"]):
-                        already_forwarded.add((t["symbol"].upper(), t["bias"].lower()))
-                except (json.JSONDecodeError, KeyError):
-                    pass
+        existing_signals = get_forwarded_signals_today(sender_key, signal_date)
+        already_forwarded = set()
+        for sig in existing_signals:
+            try:
+                for t in json.loads(sig["tickers"]):
+                    already_forwarded.add((t["symbol"].upper(), t["bias"].lower()))
+            except (json.JSONDecodeError, KeyError):
+                pass
 
-            new_combos = [
-                t for t in enriched_tickers
-                if (t.get("symbol", "").upper(), t.get("bias", "neutral").lower()) not in already_forwarded
-            ]
+        new_combos = [
+            t for t in enriched_tickers
+            if (t.get("symbol", "").upper(), t.get("bias", "neutral").lower()) not in already_forwarded
+        ]
 
-            if new_combos:
-                # At least one new ticker+bias — forward as new signal
-                logger.info(
-                    "🔔 SIGNAL (%.0f%% confidence) in %s: %s",
-                    enriched["confidence"] * 100,
-                    channel_name,
-                    enriched.get("thesis", "")[:150],
+        if new_combos:
+            logger.info(
+                "🔔 SIGNAL (%.0f%% confidence) in %s: %s",
+                enriched["confidence"] * 100,
+                channel_name,
+                enriched.get("thesis", "")[:150],
+            )
+            bot_msg_ids = await self.forwarder.forward_signal(enriched, original_texts, channel_name)
+            save_forwarded_signal(
+                sender_key=sender_key,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                signal_date=signal_date,
+                tickers=enriched_tickers,
+                thesis=enriched.get("thesis", ""),
+                original_texts=original_texts,
+                bot_message_ids={str(k): v for k, v in bot_msg_ids.items()},
+                confidence=enriched.get("confidence", 0),
+                category=enriched.get("category", ""),
+            )
+            return
+
+        # All ticker+bias combos already forwarded today — throttle
+        logger.info(
+            "🔇 Throttled signal from sender=%s in %s (all ticker+bias already forwarded today)",
+            sender_key, channel_name,
+        )
+        new_thesis = enriched.get("thesis", "")
+        best_match = self._find_best_matching_signal(existing_signals, enriched_tickers)
+        if best_match and new_thesis and new_thesis != best_match.get("thesis", ""):
+            old_texts = json.loads(best_match.get("original_texts", "[]"))
+            old_texts.extend(original_texts)
+            bot_msg_ids = json.loads(best_match.get("bot_message_ids", "{}"))
+            updated_classification = {
+                "tickers": json.loads(best_match["tickers"]),
+                "confidence": enriched.get("confidence", 0),
+                "category": best_match.get("category", ""),
+                "thesis": new_thesis,
+            }
+            if bot_msg_ids:
+                await self.forwarder.update_signal_message(
+                    best_match["id"], bot_msg_ids, updated_classification,
+                    old_texts, best_match.get("channel_name", channel_name),
                 )
-                bot_msg_ids = await self.forwarder.forward_signal(enriched, text, channel_name)
-                save_forwarded_signal(
-                    sender_key=sender_key,
-                    channel_id=matched_id,
-                    channel_name=channel_name,
-                    signal_date=signal_date,
-                    tickers=enriched_tickers,
-                    thesis=enriched.get("thesis", ""),
-                    original_texts=[text],
-                    bot_message_ids={str(k): v for k, v in bot_msg_ids.items()},
-                    confidence=enriched.get("confidence", 0),
-                    category=enriched.get("category", ""),
-                )
+                logger.info("📝 Updated throttled signal (id=%d) with new thesis", best_match["id"])
             else:
-                # All ticker+bias combos already forwarded today — throttle
-                logger.info(
-                    "🔇 Throttled signal from sender=%s in %s (all ticker+bias already forwarded today)",
-                    sender_key, channel_name,
-                )
-                # Find the best matching existing signal to update
-                new_thesis = enriched.get("thesis", "")
-                best_match = self._find_best_matching_signal(existing_signals, enriched_tickers)
-                if best_match and new_thesis and new_thesis != best_match.get("thesis", ""):
-                    old_texts = json.loads(best_match.get("original_texts", "[]"))
-                    old_texts.append(text)
-                    bot_msg_ids = json.loads(best_match.get("bot_message_ids", "{}"))
-                    updated_classification = {
-                        "tickers": json.loads(best_match["tickers"]),
-                        "confidence": enriched.get("confidence", 0),
-                        "category": best_match.get("category", ""),
-                        "thesis": new_thesis,
-                    }
-                    if bot_msg_ids:
-                        await self.forwarder.update_signal_message(
-                            best_match["id"], bot_msg_ids, updated_classification,
-                            old_texts, best_match.get("channel_name", channel_name),
-                        )
-                        logger.info("📝 Updated throttled signal (id=%d) with new thesis", best_match["id"])
-                    else:
-                        update_forwarded_signal(best_match["id"], new_thesis, old_texts)
-                        logger.info("📝 Updated thesis for throttled signal (id=%d), no bot messages to edit", best_match["id"])
-        else:
-            conf = enriched.get("confidence", 0) if enriched else 0
-            logger.info("⬜ Enrichment downgraded signal in %s (%.0f%% confidence)", channel_name, conf * 100)
+                update_forwarded_signal(best_match["id"], new_thesis, old_texts)
+                logger.info("📝 Updated thesis for throttled signal (id=%d), no bot messages to edit", best_match["id"])
 
     @staticmethod
     def _find_best_matching_signal(existing_signals: list[dict], tickers: list[dict]) -> dict | None:

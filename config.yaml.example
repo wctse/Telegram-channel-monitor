@@ -5,12 +5,17 @@ channels:
     enabled: true
     confidence_threshold: 0.7
     context_lookback_minutes: 30
+    # Optional: wait N seconds after each new message before running the LLM,
+    # resetting the timer if more arrive. Useful for senders who split one
+    # idea across multiple messages. 0 or omitted = no batching.
+    batch_delay_seconds: 0
 
   - name: "Another Channel"
     id: null
     enabled: true
     confidence_threshold: 0.7
     context_lookback_minutes: 30
+    batch_delay_seconds: 20  # group bursts from this channel within 20s
 
 # LLM provider config
 # provider: "ollama" for local, "api" for OpenRouter/Groq/OpenAI-compatible
