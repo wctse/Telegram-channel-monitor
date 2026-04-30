@@ -159,7 +159,11 @@ async def main():
     )
 
     # Init forwarder bot
-    forwarder = SignalForwarder(bot_token)
+    bot_conf = config.get("bot", {})
+    forwarder = SignalForwarder(
+        bot_token,
+        allowed_groups=bot_conf.get("allowed_groups", []),
+    )
 
     # Init channel listener
     channels = config.get("channels", [])

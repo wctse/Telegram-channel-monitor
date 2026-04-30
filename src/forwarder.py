@@ -2,7 +2,7 @@ import logging
 import os
 from html import escape as html_escape
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from src.db import save_bot_user, get_bot_users, update_forwarded_signal
 
@@ -23,15 +23,18 @@ logger = logging.getLogger(__name__)
 
 
 class SignalForwarder:
-    def __init__(self, bot_token: str):
+    def __init__(self, bot_token: str, allowed_groups: list[str] | None = None):
         self.bot_token = bot_token
         self.app: Application | None = None
         self._allowed_chat_ids = _load_allowed_chat_ids()
+        self._allowed_groups = {g.strip().lower() for g in (allowed_groups or []) if g and g.strip()}
+        self._pending_chats: set[int] = set()
 
     async def start_bot(self):
         self.app = Application.builder().token(self.bot_token).build()
         self.app.add_handler(CommandHandler("start", self._handle_start))
         self.app.add_handler(CommandHandler("status", self._handle_status))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
 
         await self.app.initialize()
         await self.app.start()
@@ -47,16 +50,68 @@ class SignalForwarder:
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         chat_id = update.effective_chat.id
-        if self._allowed_chat_ids and chat_id not in self._allowed_chat_ids:
-            logger.warning("Unauthorized /start from chat_id=%d (%s)", chat_id, user.username)
-            await update.message.reply_text("⛔ You are not authorized to use this bot.")
+
+        # Admin whitelist bypass
+        if chat_id in self._allowed_chat_ids:
+            save_bot_user(chat_id, user.username, user.first_name)
+            self._pending_chats.discard(chat_id)
+            logger.info("Registered admin user: %s (chat_id=%d)", user.username, chat_id)
+            await update.message.reply_text(
+                f"✅ Registered! Your chat ID: {chat_id}\n\n"
+                "You'll receive high-signal messages from monitored channels here."
+            )
             return
-        save_bot_user(chat_id, user.username, user.first_name)
-        logger.info("Registered user: %s (chat_id=%d)", user.username, chat_id)
+
+        # Already registered
+        if chat_id in get_bot_users():
+            await update.message.reply_text(
+                f"✅ You're already registered. Your chat ID: {chat_id}"
+            )
+            return
+
+        # Gate: ask which group they got the link from
+        if not self._allowed_groups:
+            # No gate configured — fall back to open registration
+            save_bot_user(chat_id, user.username, user.first_name)
+            logger.info("Registered user (no gate): %s (chat_id=%d)", user.username, chat_id)
+            await update.message.reply_text(
+                f"✅ Registered! Your chat ID: {chat_id}\n\n"
+                "You'll receive high-signal messages from monitored channels here."
+            )
+            return
+
+        self._pending_chats.add(chat_id)
+        logger.info("Gating /start from chat_id=%d (%s): awaiting group answer", chat_id, user.username)
         await update.message.reply_text(
-            f"✅ Registered! Your chat ID: {chat_id}\n\n"
-            "You'll receive high-signal messages from monitored channels here."
+            "👋 Before I can register you, please answer:\n\n"
+            "Which group did you get this monitor bot link from?"
         )
+
+    async def _handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        if chat_id not in self._pending_chats:
+            return  # Ignore random text from non-pending chats
+        user = update.effective_user
+        answer = (update.message.text or "").strip().lower()
+        if answer in self._allowed_groups:
+            self._pending_chats.discard(chat_id)
+            save_bot_user(chat_id, user.username, user.first_name)
+            logger.info(
+                "Registered user via group gate: %s (chat_id=%d, group=%r)",
+                user.username, chat_id, update.message.text.strip(),
+            )
+            await update.message.reply_text(
+                f"✅ Registered! Your chat ID: {chat_id}\n\n"
+                "You'll receive high-signal messages from monitored channels here."
+            )
+        else:
+            logger.warning(
+                "Group gate failed for chat_id=%d (%s): answer=%r",
+                chat_id, user.username, update.message.text.strip(),
+            )
+            await update.message.reply_text(
+                "❌ That group is not recognized. Please try again, or /start to restart."
+            )
 
     async def _handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
