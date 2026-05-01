@@ -19,6 +19,7 @@ class LLMClassifier:
         api_key: str | None = None,
         timeout: int = 120,
         fallback_model: str | None = None,
+        max_enrich_chars: int = 30000,
     ):
         self.provider = provider  # "ollama" or "api"
         self.base_url = base_url.rstrip("/")
@@ -28,6 +29,7 @@ class LLMClassifier:
         self.enrich_prompt = enrich_prompt
         self.api_key = api_key
         self.timeout = timeout
+        self.max_enrich_chars = max_enrich_chars
         self._session: aiohttp.ClientSession | None = None
 
     async def open(self):
@@ -59,25 +61,69 @@ class LLMClassifier:
 
     async def enrich(self, signal_text: str, context_texts: list[str], sender_history_texts: list[str] | None = None) -> dict | None:
         """Stage 2: Given a signal message and surrounding context, produce a full synthesis."""
-        parts = []
-        if sender_history_texts:
-            parts.append("PREVIOUS MESSAGES FROM THIS SENDER TODAY (oldest first):")
-            for i, t in enumerate(sender_history_texts, 1):
-                parts.append(f"--- sender message {i} ---\n{t}")
-            parts.append("")
-        if context_texts:
-            parts.append("RECENT CONTEXT FROM THIS CHANNEL (oldest first):")
-            for i, t in enumerate(context_texts, 1):
-                parts.append(f"--- message {i} ---\n{t}")
-            parts.append("")
-        parts.append("SIGNAL MESSAGE (classify this):")
-        parts.append(signal_text)
-        user_content = "\n".join(parts)
+        user_content = self._build_enrich_user_content(signal_text, context_texts, sender_history_texts)
 
         raw = await self._llm_call(self.enrich_prompt, user_content)
         if raw is None:
             return None
         return self._parse_enrich(raw)
+
+    def _build_enrich_user_content(
+        self,
+        signal_text: str,
+        context_texts: list[str],
+        sender_history_texts: list[str] | None,
+    ) -> str:
+        sender_msgs = list(sender_history_texts or [])
+        context_msgs = list(context_texts or [])
+        dropped_sender = 0
+        dropped_context = 0
+
+        def render() -> str:
+            parts = []
+            if sender_msgs:
+                parts.append("PREVIOUS MESSAGES FROM THIS SENDER TODAY (oldest first):")
+                for i, t in enumerate(sender_msgs, 1):
+                    parts.append(f"--- sender message {i} ---\n{t}")
+                parts.append("")
+            if context_msgs:
+                parts.append("RECENT CONTEXT FROM THIS CHANNEL (oldest first):")
+                for i, t in enumerate(context_msgs, 1):
+                    parts.append(f"--- message {i} ---\n{t}")
+                parts.append("")
+            parts.append("SIGNAL MESSAGE (classify this):")
+            parts.append(signal_text)
+            return "\n".join(parts)
+
+        user_content = render()
+        while len(user_content) > self.max_enrich_chars and (sender_msgs or context_msgs):
+            can_drop_sender = len(sender_msgs) > 1
+            can_drop_context = len(context_msgs) > 1
+
+            if can_drop_sender and (not can_drop_context or len(sender_msgs) >= len(context_msgs)):
+                sender_msgs.pop(0)
+                dropped_sender += 1
+            elif can_drop_context:
+                context_msgs.pop(0)
+                dropped_context += 1
+            elif sender_msgs:
+                sender_msgs.pop(0)
+                dropped_sender += 1
+            elif context_msgs:
+                context_msgs.pop(0)
+                dropped_context += 1
+
+            user_content = render()
+
+        if dropped_sender or dropped_context:
+            logger.warning(
+                "Truncated enrich prompt: dropped %d sender and %d context message(s) to fit %d chars",
+                dropped_sender,
+                dropped_context,
+                self.max_enrich_chars,
+            )
+
+        return user_content
 
     async def _llm_call(self, system_prompt: str, user_content: str) -> str | None:
         """Route to the correct provider and return raw LLM content string."""

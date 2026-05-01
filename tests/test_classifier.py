@@ -114,6 +114,51 @@ class TestSessionLifecycle(unittest.TestCase):
         asyncio.run(_run())
 
 
+class TestEnrichPromptTruncation(unittest.TestCase):
+    def test_drops_oldest_sender_messages_first_when_multiple(self):
+        c = LLMClassifier(
+            "ollama",
+            "http://localhost",
+            "m",
+            "sys",
+            "sys",
+            max_enrich_chars=210,
+        )
+
+        sender_history = ["sender-old-1-" + ("x" * 70), "sender-new-2"]
+        context = ["context-only"]
+        signal = "signal-core"
+
+        user_content = c._build_enrich_user_content(signal, context, sender_history)
+
+        self.assertNotIn("sender-old-1", user_content)
+        self.assertIn("context-only", user_content)
+        self.assertIn("SIGNAL MESSAGE (classify this):\nsignal-core", user_content)
+        self.assertLessEqual(len(user_content), c.max_enrich_chars)
+
+    def test_drops_oldest_context_messages_when_sender_not_multiple(self):
+        c = LLMClassifier(
+            "ollama",
+            "http://localhost",
+            "m",
+            "sys",
+            "sys",
+            max_enrich_chars=230,
+        )
+
+        sender_history = ["sender-single"]
+        context = ["context-old-1-" + ("y" * 80), "context-new-2"]
+        signal = "signal-core"
+
+        user_content = c._build_enrich_user_content(signal, context, sender_history)
+
+        self.assertIn("sender-single", user_content)
+        self.assertNotIn("context-old-1", user_content)
+        self.assertIn("context-new-2", user_content)
+        self.assertIn("SIGNAL MESSAGE (classify this):\nsignal-core", user_content)
+        self.assertLessEqual(len(user_content), c.max_enrich_chars)
+
+
 class TestOllamaIntegration(unittest.TestCase):
     """Tests against a fake Ollama HTTP server."""
 
