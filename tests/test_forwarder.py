@@ -127,5 +127,68 @@ class TestForwardSignalMessage(unittest.TestCase):
         asyncio.run(_run())
 
 
+def _make_update(chat_id, username="testuser", first_name="Test", text=None):
+    update = mock.MagicMock()
+    update.effective_user.username = username
+    update.effective_user.first_name = first_name
+    update.effective_chat.id = chat_id
+    update.message.reply_text = mock.AsyncMock()
+    update.message.text = text
+    return update
+
+
+class TestGroupRegistrationGate(unittest.IsolatedAsyncioTestCase):
+    def _make_forwarder(self, allowed_groups=None):
+        from src.forwarder import SignalForwarder
+        fwd = SignalForwarder.__new__(SignalForwarder)
+        fwd.bot_token = "fake"
+        fwd.app = mock.MagicMock()
+        fwd._allowed_chat_ids = set()
+        fwd._allowed_groups = {g.strip().lower() for g in (allowed_groups or [])}
+        fwd._pending_chats = set()
+        return fwd
+
+    async def test_correct_group_answer_registers_user(self):
+        """User who answers with the correct group name gets registered."""
+        fwd = self._make_forwarder(allowed_groups=["alpha-group"])
+
+        start_update = _make_update(chat_id=999)
+        with mock.patch("src.forwarder.get_bot_users", return_value=[]):
+            await fwd._handle_start(start_update, mock.MagicMock())
+
+        self.assertIn(999, fwd._pending_chats)
+
+        text_update = _make_update(chat_id=999, text="alpha-group")
+        with mock.patch("src.forwarder.save_bot_user") as mock_save:
+            await fwd._handle_text(text_update, mock.MagicMock())
+
+        mock_save.assert_called_once_with(999, "testuser", "Test")
+        self.assertNotIn(999, fwd._pending_chats)
+
+    async def test_wrong_group_answer_rejects_user(self):
+        """User answering with an unrecognized group stays pending and is not registered."""
+        fwd = self._make_forwarder(allowed_groups=["alpha-group"])
+        fwd._pending_chats.add(999)
+
+        text_update = _make_update(chat_id=999, text="wrong-group")
+        with mock.patch("src.forwarder.save_bot_user") as mock_save:
+            await fwd._handle_text(text_update, mock.MagicMock())
+
+        mock_save.assert_not_called()
+        self.assertIn(999, fwd._pending_chats)
+
+    async def test_empty_allowed_groups_allows_open_registration(self):
+        """When allowed_groups is empty, /start registers anyone without asking for a group."""
+        fwd = self._make_forwarder(allowed_groups=[])
+
+        start_update = _make_update(chat_id=999)
+        with mock.patch("src.forwarder.get_bot_users", return_value=[]), \
+             mock.patch("src.forwarder.save_bot_user") as mock_save:
+            await fwd._handle_start(start_update, mock.MagicMock())
+
+        mock_save.assert_called_once()
+        self.assertNotIn(999, fwd._pending_chats)
+
+
 if __name__ == "__main__":
     unittest.main()

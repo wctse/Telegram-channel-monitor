@@ -257,3 +257,5 @@ def get_bot_users() -> list[int]:
         return [row["chat_id"] for row in rows]
     finally:
         conn.close()
+
+

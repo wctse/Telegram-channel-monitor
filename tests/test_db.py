@@ -5,7 +5,14 @@ import unittest
 from datetime import datetime, timezone, timedelta
 from unittest import mock
 
-from src.db import init_db, save_message, save_bot_user, get_recent_messages, get_bot_users, get_connection, DB_PATH
+from src.db import (
+    init_db,
+    save_message,
+    save_bot_user,
+    get_recent_messages,
+    get_bot_users,
+    get_connection,
+)
 
 
 class DBTestCase(unittest.TestCase):
@@ -32,6 +39,7 @@ class TestInitDB(DBTestCase):
         names = {r["name"] for r in tables}
         self.assertIn("messages", names)
         self.assertIn("bot_users", names)
+        self.assertIn("forwarded_signals", names)
         conn.close()
 
     def test_idempotent(self):
@@ -197,6 +205,7 @@ class TestBotUsers(DBTestCase):
 
     def test_empty(self):
         self.assertEqual(get_bot_users(), [])
+
 
 
 if __name__ == "__main__":

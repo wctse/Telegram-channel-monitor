@@ -180,7 +180,6 @@ async def main():
         disconnect_window_seconds=listener_conf.get("disconnect_window_seconds", 600),
     )
 
-    # Start bot and listener concurrently
     try:
         await classifier.open()
         await forwarder.start_bot()
