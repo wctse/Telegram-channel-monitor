@@ -7,6 +7,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from src.db import save_bot_user, get_bot_users, update_forwarded_signal
 
 
+_ADMIN_ONLY_PREFIX = "🔒 <b>[ADMIN ONLY]</b>\n"
+
+
+def prefix_admin_only_message(message: str) -> str:
+    return f"{_ADMIN_ONLY_PREFIX}{message}"
+
+
 def _load_allowed_chat_ids() -> set[int]:
     raw = os.getenv("ALLOWED_CHAT_IDS", "")
     ids = set()
@@ -258,7 +265,7 @@ class SignalForwarder:
         if not self.app or not self.app.bot:
             return
 
-        text = (
+        text = prefix_admin_only_message(
             f"⚠️ <b>Error Alert</b>\n\n"
             f"<pre>{html_escape(_truncate(error_message, 3000))}</pre>"
         )
